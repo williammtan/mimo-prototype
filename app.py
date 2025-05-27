@@ -21,8 +21,14 @@ RESUME_DIR = pathlib.Path("resumes")          # each file: *.json
 INDEX_PATH  = pathlib.Path("resume_faiss.idx")
 IDMAP_PATH  = pathlib.Path("resume_id_map.pkl")
 EMBED_MODEL = "text-embedding-3-small"        # or any other embedding model
-LLM_MODEL   = "gpt-4o"             # model that supports structured outputs
+LLM_MODEL   = "gpt-4o-mini"             # model that supports structured outputs
 TOP_K_DEFAULT = 10
+DEFAULT_WEIGHTS = {
+    "work_experience": 0.4,
+    "skills": 0.3,
+    "education": 0.2,
+    "certifications_extracurricular": 0.1
+}
 # ---------------------------- #
 
 client = OpenAI()  # relies on OPENAI_API_KEY env var
@@ -141,17 +147,26 @@ def extract_name(resume_json: dict) -> str:
     return cleaned.title()
 
 
-def process_candidate(path: str, score_sim: float, jd_input: str) -> dict:
+def process_candidate(path: str, score_sim: float, jd_input: str, weights: dict) -> dict:
     """Process a single candidate in parallel."""
     data = json.loads(pathlib.Path(path).read_text("utf-8"))
     candidate_name = extract_name(data)
     resume_text = json.dumps(data, ensure_ascii=False)
     score_report = llm_score(jd_input, resume_text)
     
+    # Calculate weighted score
+    weighted_score = (
+        score_report.ratings.work_experience * weights["work_experience"] +
+        score_report.ratings.skills * weights["skills"] +
+        score_report.ratings.education * weights["education"] +
+        score_report.ratings.certifications_extracurricular * weights["certifications_extracurricular"]
+    )
+    
     return {
         "name": candidate_name,
         "similarity": round(score_sim, 3),
         "overall_match": score_report.ratings.overall_match,
+        "weighted_score": round(weighted_score, 2),
         "detail": score_report,
         "ai_summary": data.get("personal_infos", {}).get("ai_summary", [])
     }
@@ -167,6 +182,21 @@ with st.sidebar:
     jd_input = st.text_area("Job Description", height=300, placeholder="Paste the full JD …")
     top_n    = st.number_input("Top-N candidates to score", min_value=1, max_value=50,
                                value=TOP_K_DEFAULT, step=1)
+    
+    st.markdown("### Score Weights")
+    st.markdown("Adjust the importance of each scoring component:")
+    weights = {
+        "work_experience": st.slider("Work Experience", 0.0, 1.0, DEFAULT_WEIGHTS["work_experience"], 0.1),
+        "skills": st.slider("Skills", 0.0, 1.0, DEFAULT_WEIGHTS["skills"], 0.1),
+        "education": st.slider("Education", 0.0, 1.0, DEFAULT_WEIGHTS["education"], 0.1),
+        "certifications_extracurricular": st.slider("Certs/Extra", 0.0, 1.0, DEFAULT_WEIGHTS["certifications_extracurricular"], 0.1)
+    }
+    
+    # Normalize weights to sum to 1
+    total_weight = sum(weights.values())
+    if total_weight > 0:
+        weights = {k: v/total_weight for k, v in weights.items()}
+    
     run_btn  = st.button("Search & Rank")
 
 if run_btn:
@@ -186,7 +216,7 @@ if run_btn:
     with ThreadPoolExecutor(max_workers=10) as executor:
         # Create future tasks
         future_to_candidate = {
-            executor.submit(process_candidate, path, score_sim, jd_input): (path, score_sim)
+            executor.submit(process_candidate, path, score_sim, jd_input, weights): (path, score_sim)
             for path, score_sim in hits
         }
         
@@ -201,16 +231,17 @@ if run_btn:
             except Exception as e:
                 st.error(f"Error processing candidate: {str(e)}")
 
-    # sort by LLM overall_match (desc)
-    results.sort(key=lambda r: r["overall_match"], reverse=True)
+    # sort by weighted score (desc)
+    results.sort(key=lambda r: r["weighted_score"], reverse=True)
 
-    st.success(f"Found {len(results)} candidates. Sorted by LLM overall_match ↓")
+    st.success(f"Found {len(results)} candidates. Sorted by weighted score ↓")
 
     # ---------- results table ---------- #
     import pandas as pd
     table_df = pd.DataFrame([
         {
             "Name": r["name"],
+            "Weighted Score": r["weighted_score"],
             "Overall Match": r["overall_match"],
             "Similarity": r["similarity"],
             "Work Exp": r["detail"].ratings.work_experience,
